@@ -1,0 +1,50 @@
+[project]
+name = "agents-on-azure"
+version = "0.1.0"
+description = "Practical examples combining AI Agent frameworks with Azure messaging services"
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "MIT" }
+
+dependencies = [
+    "shared",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.uv.sources]
+shared = { workspace = true }
+
+[tool.uv.workspace]
+members = [
+    "shared",
+    "samples/semantic-kernel/single-agent",
+    "samples/semantic-kernel/multi-agent-servicebus",
+    "samples/semantic-kernel/multi-agent-eventhub",
+    "samples/semantic-kernel/multi-agent-eventgrid",
+    "samples/langgraph/single-agent",
+    "samples/langgraph/multi-agent-servicebus",
+    "samples/langgraph/multi-agent-eventhub",
+    "samples/langgraph/multi-agent-eventgrid",
+    "samples/autogen/single-agent",
+    "samples/autogen/multi-agent-servicebus",
+    "samples/autogen/multi-agent-eventhub",
+    "samples/autogen/multi-agent-eventgrid",
+    "samples/microsoft-agent-framework/single-agent",
+    "samples/microsoft-agent-framework/multi-agent-servicebus",
+    "samples/microsoft-agent-framework/multi-agent-eventhub",
+    "samples/microsoft-agent-framework/multi-agent-eventgrid",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

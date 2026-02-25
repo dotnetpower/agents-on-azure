@@ -1,0 +1,23 @@
+[project]
+name = "sk-single-agent"
+version = "0.1.0"
+description = "Semantic Kernel single-agent document analysis-summary-review pipeline"
+requires-python = ">=3.11"
+
+dependencies = [
+    "semantic-kernel>=1.15.0",
+    "azure-identity>=1.15.0",
+    "structlog>=24.0.0",
+    "python-dotenv>=1.0.0",
+    "shared",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.uv.sources]
+shared = { workspace = true }

@@ -1,0 +1,409 @@
+#!/bin/bash
+set -e
+
+# ============================================================
+# Agents on Azure - Resource Provisioning Script
+# ============================================================
+# Provisions ALL Azure resources needed for the multi-agent samples,
+# including messaging queues/hubs/subscriptions, storage, and RBAC roles.
+#
+# Security policy:
+#   - Local auth (keys/SAS) disabled on all resources
+#   - DefaultAzureCredential (Managed Identity / az login) only
+#   - Least-privilege RBAC role assignments
+#
+# Usage:
+#   cp provision.sh.example provision.sh
+#   chmod +x provision.sh
+#   # Edit RG and LOCATION below if needed
+#   ./provision.sh
+# ============================================================
+
+# --- Customize these variables ---
+RG="rg-agents-on-azure"
+LOCATION="koreacentral"
+# ---------------------------------
+
+SUFFIX=$(openssl rand -hex 3)  # unique suffix for resource names
+
+echo ""
+echo "============================================================"
+echo "  Agents on Azure - Full Provisioning (suffix: ${SUFFIX})"
+echo "============================================================"
+echo ""
+
+# ============================================================
+# 1. Resource Group
+# ============================================================
+echo "=== 1/14. Create Resource Group ==="
+az group create --name $RG --location $LOCATION -o none
+
+# ============================================================
+# 2. Azure OpenAI
+# ============================================================
+echo "=== 2/14. Create Azure OpenAI Resource ==="
+AOAI_NAME="aoai-agents-${SUFFIX}"
+az cognitiveservices account create \
+  --name $AOAI_NAME \
+  --resource-group $RG \
+  --location $LOCATION \
+  --kind OpenAI \
+  --sku S0 \
+  --custom-domain $AOAI_NAME \
+  --disable-local-auth true \
+  -o none
+
+echo "=== 3/14. Deploy Azure OpenAI Model (gpt-4o) ==="
+az cognitiveservices account deployment create \
+  --name $AOAI_NAME \
+  --resource-group $RG \
+  --deployment-name gpt-4o \
+  --model-name gpt-4o \
+  --model-version "2024-08-06" \
+  --model-format OpenAI \
+  --sku-capacity 10 \
+  --sku-name GlobalStandard \
+  -o none
+
+AOAI_ENDPOINT=$(az cognitiveservices account show \
+  --name $AOAI_NAME \
+  --resource-group $RG \
+  --query "properties.endpoint" -o tsv)
+
+# ============================================================
+# 3. Azure Service Bus (namespace + queues)
+# ============================================================
+echo "=== 4/14. Create Azure Service Bus Namespace ==="
+SB_NAME="sb-agents-${SUFFIX}"
+az servicebus namespace create \
+  --name $SB_NAME \
+  --resource-group $RG \
+  --location $LOCATION \
+  --sku Standard \
+  --disable-local-auth true \
+  -o none
+
+SB_NAMESPACE="${SB_NAME}.servicebus.windows.net"
+
+echo "=== 5/14. Create Service Bus Queues ==="
+for QUEUE in analyzer-tasks summarizer-tasks reviewer-tasks pipeline-results; do
+  echo "  Queue: $QUEUE"
+  az servicebus queue create \
+    --name "$QUEUE" \
+    --namespace-name "$SB_NAME" \
+    --resource-group "$RG" \
+    --default-message-time-to-live P1D \
+    --max-delivery-count 5 \
+    --enable-dead-lettering-on-message-expiration true \
+    -o none
+done
+
+# ============================================================
+# 4. Azure Event Hubs (namespace + hubs + consumer groups)
+# ============================================================
+echo "=== 6/14. Create Azure Event Hubs Namespace ==="
+EH_NS_NAME="eh-agents-${SUFFIX}"
+EH_NAME="agent-events"
+az eventhubs namespace create \
+  --name $EH_NS_NAME \
+  --resource-group $RG \
+  --location $LOCATION \
+  --sku Standard \
+  --disable-local-auth true \
+  -o none
+
+echo "=== 7/14. Create Event Hubs ==="
+az eventhubs eventhub create \
+  --name $EH_NAME \
+  --namespace-name $EH_NS_NAME \
+  --resource-group $RG \
+  --partition-count 4 \
+  --cleanup-policy Delete \
+  --retention-time 24 \
+  -o none
+
+for HUB in analysis-results summary-results review-results; do
+  echo "  Hub: $HUB"
+  az eventhubs eventhub create \
+    --name "$HUB" \
+    --namespace-name "$EH_NS_NAME" \
+    --resource-group "$RG" \
+    --partition-count 2 \
+    --cleanup-policy Delete \
+    --retention-time 24 \
+    -o none
+done
+
+EH_NAMESPACE="${EH_NS_NAME}.servicebus.windows.net"
+
+echo "=== 8/14. Create Event Hubs Consumer Groups ==="
+az eventhubs eventhub consumer-group create \
+  --name analyzer-cg --eventhub-name agent-events \
+  --namespace-name "$EH_NS_NAME" --resource-group "$RG" -o none
+
+az eventhubs eventhub consumer-group create \
+  --name summarizer-cg --eventhub-name analysis-results \
+  --namespace-name "$EH_NS_NAME" --resource-group "$RG" -o none
+
+az eventhubs eventhub consumer-group create \
+  --name reviewer-cg --eventhub-name summary-results \
+  --namespace-name "$EH_NS_NAME" --resource-group "$RG" -o none
+
+az eventhubs eventhub consumer-group create \
+  --name results-cg --eventhub-name review-results \
+  --namespace-name "$EH_NS_NAME" --resource-group "$RG" -o none
+
+# ============================================================
+# 5. Azure Event Grid Topic
+# ============================================================
+echo "=== 9/14. Create Azure Event Grid Topic ==="
+EG_TOPIC_NAME="egt-agents-${SUFFIX}"
+az eventgrid topic create \
+  --name $EG_TOPIC_NAME \
+  --resource-group $RG \
+  --location $LOCATION \
+  --input-schema cloudeventschemav1_0 \
+  -o none
+
+EG_ENDPOINT=$(az eventgrid topic show \
+  --name $EG_TOPIC_NAME \
+  --resource-group $RG \
+  --query "endpoint" -o tsv)
+
+TOPIC_RESOURCE_ID=$(az eventgrid topic show \
+  --name "$EG_TOPIC_NAME" --resource-group "$RG" --query "id" -o tsv)
+
+# ============================================================
+# 6. Storage Account (checkpoint store + Event Grid queues)
+# ============================================================
+echo "=== 10/14. Create Storage Account ==="
+STORAGE_NAME="stagents${SUFFIX}"
+az storage account create \
+  --name "$STORAGE_NAME" \
+  --resource-group "$RG" \
+  --location "$LOCATION" \
+  --sku Standard_LRS \
+  --kind StorageV2 \
+  --min-tls-version TLS1_2 \
+  --allow-shared-key-access false \
+  -o none
+
+STORAGE_RESOURCE_ID=$(az storage account show \
+  --name "$STORAGE_NAME" --resource-group "$RG" --query "id" -o tsv)
+
+# ============================================================
+# 7. Application Insights
+# ============================================================
+echo "=== 11/14. Create Application Insights ==="
+APPINS_NAME="appi-agents-${SUFFIX}"
+az monitor app-insights component create \
+  --app $APPINS_NAME \
+  --location $LOCATION \
+  --resource-group $RG \
+  --application-type web \
+  -o none
+
+APPINS_CONNSTR=$(az monitor app-insights component show \
+  --app $APPINS_NAME \
+  --resource-group $RG \
+  --query "connectionString" -o tsv)
+
+# ============================================================
+# 8. RBAC Role Assignments
+# ============================================================
+echo "=== 12/14. Assign RBAC Roles ==="
+USER_OBJECT_ID=$(az ad signed-in-user show --query "id" -o tsv)
+
+# Cognitive Services OpenAI User
+AOAI_RESOURCE_ID=$(az cognitiveservices account show \
+  --name "$AOAI_NAME" --resource-group "$RG" --query "id" -o tsv)
+echo "  Cognitive Services OpenAI User"
+az role assignment create \
+  --assignee "$USER_OBJECT_ID" \
+  --role "Cognitive Services OpenAI User" \
+  --scope "$AOAI_RESOURCE_ID" \
+  -o none 2>/dev/null || echo "    (already assigned)"
+
+# Service Bus Data Owner
+SB_RESOURCE_ID=$(az servicebus namespace show \
+  --name "$SB_NAME" --resource-group "$RG" --query "id" -o tsv)
+echo "  Azure Service Bus Data Owner"
+az role assignment create \
+  --assignee "$USER_OBJECT_ID" \
+  --role "Azure Service Bus Data Owner" \
+  --scope "$SB_RESOURCE_ID" \
+  -o none 2>/dev/null || echo "    (already assigned)"
+
+# Event Hubs Data Owner
+EH_RESOURCE_ID=$(az eventhubs namespace show \
+  --name "$EH_NS_NAME" --resource-group "$RG" --query "id" -o tsv)
+echo "  Azure Event Hubs Data Owner"
+az role assignment create \
+  --assignee "$USER_OBJECT_ID" \
+  --role "Azure Event Hubs Data Owner" \
+  --scope "$EH_RESOURCE_ID" \
+  -o none 2>/dev/null || echo "    (already assigned)"
+
+# EventGrid Data Sender
+echo "  EventGrid Data Sender"
+az role assignment create \
+  --assignee "$USER_OBJECT_ID" \
+  --role "EventGrid Data Sender" \
+  --scope "$TOPIC_RESOURCE_ID" \
+  -o none 2>/dev/null || echo "    (already assigned)"
+
+# Storage Blob Data Contributor
+echo "  Storage Blob Data Contributor"
+az role assignment create \
+  --assignee "$USER_OBJECT_ID" \
+  --role "Storage Blob Data Contributor" \
+  --scope "$STORAGE_RESOURCE_ID" \
+  -o none 2>/dev/null || echo "    (already assigned)"
+
+# Storage Queue Data Contributor
+echo "  Storage Queue Data Contributor"
+az role assignment create \
+  --assignee "$USER_OBJECT_ID" \
+  --role "Storage Queue Data Contributor" \
+  --scope "$STORAGE_RESOURCE_ID" \
+  -o none 2>/dev/null || echo "    (already assigned)"
+
+echo "  Waiting 30s for RBAC propagation..."
+sleep 30
+
+# ============================================================
+# 9. Storage Containers & Queues (after RBAC propagation)
+# ============================================================
+echo "=== 13/14. Create Storage Containers & Queues ==="
+
+echo "  Blob container: eventhub-checkpoints"
+az storage container create \
+  --name eventhub-checkpoints \
+  --account-name "$STORAGE_NAME" \
+  --auth-mode login \
+  -o none
+
+for QUEUE in analyzer-events summarizer-events reviewer-events results-events; do
+  echo "  Storage queue: $QUEUE"
+  az storage queue create \
+    --name "$QUEUE" \
+    --account-name "$STORAGE_NAME" \
+    --auth-mode login \
+    -o none
+done
+
+# ============================================================
+# 10. Event Grid Subscriptions (Topic → Storage Queues)
+# ============================================================
+echo "=== 14/14. Create Event Grid Subscriptions ==="
+
+echo "  sub-analyzer:   TaskSubmitted → analyzer-events"
+az eventgrid event-subscription create \
+  --name sub-analyzer \
+  --source-resource-id "$TOPIC_RESOURCE_ID" \
+  --endpoint-type storagequeue \
+  --endpoint "${STORAGE_RESOURCE_ID}/queueservices/default/queues/analyzer-events" \
+  --event-delivery-schema cloudeventschemav1_0 \
+  --included-event-types TaskSubmitted \
+  -o none
+
+echo "  sub-summarizer: AnalysisCompleted → summarizer-events"
+az eventgrid event-subscription create \
+  --name sub-summarizer \
+  --source-resource-id "$TOPIC_RESOURCE_ID" \
+  --endpoint-type storagequeue \
+  --endpoint "${STORAGE_RESOURCE_ID}/queueservices/default/queues/summarizer-events" \
+  --event-delivery-schema cloudeventschemav1_0 \
+  --included-event-types AnalysisCompleted \
+  -o none
+
+echo "  sub-reviewer:   SummaryCompleted → reviewer-events"
+az eventgrid event-subscription create \
+  --name sub-reviewer \
+  --source-resource-id "$TOPIC_RESOURCE_ID" \
+  --endpoint-type storagequeue \
+  --endpoint "${STORAGE_RESOURCE_ID}/queueservices/default/queues/reviewer-events" \
+  --event-delivery-schema cloudeventschemav1_0 \
+  --included-event-types SummaryCompleted \
+  -o none
+
+echo "  sub-results:    ReviewCompleted → results-events"
+az eventgrid event-subscription create \
+  --name sub-results \
+  --source-resource-id "$TOPIC_RESOURCE_ID" \
+  --endpoint-type storagequeue \
+  --endpoint "${STORAGE_RESOURCE_ID}/queueservices/default/queues/results-events" \
+  --event-delivery-schema cloudeventschemav1_0 \
+  --included-event-types ReviewCompleted \
+  -o none
+
+# ============================================================
+# 11. Generate .env file
+# ============================================================
+cat > .env <<EOF
+# Azure OpenAI
+AZURE_OPENAI_ENDPOINT=${AOAI_ENDPOINT}
+AZURE_OPENAI_MODEL=gpt-4o
+
+# Azure Service Bus
+AZURE_SERVICEBUS_NAMESPACE=${SB_NAMESPACE}
+
+# Azure Event Hubs
+AZURE_EVENTHUB_NAMESPACE=${EH_NAMESPACE}
+AZURE_EVENTHUB_NAME=${EH_NAME}
+
+# Azure Event Grid
+AZURE_EVENTGRID_ENDPOINT=${EG_ENDPOINT}
+
+# Observability
+APPLICATIONINSIGHTS_CONNECTION_STRING=${APPINS_CONNSTR}
+
+# Azure Storage (checkpoint store & Event Grid queue destinations)
+AZURE_STORAGE_ACCOUNT_NAME=${STORAGE_NAME}
+
+# Service Bus Queue Names
+AZURE_SERVICEBUS_QUEUE_ANALYZER=analyzer-tasks
+AZURE_SERVICEBUS_QUEUE_SUMMARIZER=summarizer-tasks
+AZURE_SERVICEBUS_QUEUE_REVIEWER=reviewer-tasks
+AZURE_SERVICEBUS_QUEUE_RESULTS=pipeline-results
+
+# Event Hubs Names (pipeline stages)
+AZURE_EVENTHUB_ANALYSIS=analysis-results
+AZURE_EVENTHUB_SUMMARY=summary-results
+AZURE_EVENTHUB_REVIEW=review-results
+
+# Event Hubs Consumer Groups
+AZURE_EVENTHUB_CG_ANALYZER=analyzer-cg
+AZURE_EVENTHUB_CG_SUMMARIZER=summarizer-cg
+AZURE_EVENTHUB_CG_REVIEWER=reviewer-cg
+AZURE_EVENTHUB_CG_RESULTS=results-cg
+
+# Event Grid Storage Queue Names (push destinations)
+AZURE_EVENTGRID_QUEUE_ANALYZER=analyzer-events
+AZURE_EVENTGRID_QUEUE_SUMMARIZER=summarizer-events
+AZURE_EVENTGRID_QUEUE_REVIEWER=reviewer-events
+AZURE_EVENTGRID_QUEUE_RESULTS=results-events
+EOF
+
+echo ""
+echo "============================================================"
+echo "  Provisioning Complete!"
+echo "============================================================"
+echo ""
+echo "  Resource Group:    $RG"
+echo "  OpenAI:            $AOAI_NAME ($AOAI_ENDPOINT)"
+echo "  Service Bus:       $SB_NAMESPACE"
+echo "    Queues:          analyzer-tasks, summarizer-tasks,"
+echo "                     reviewer-tasks, pipeline-results"
+echo "  Event Hubs:        $EH_NAMESPACE"
+echo "    Hubs:            $EH_NAME, analysis-results,"
+echo "                     summary-results, review-results"
+echo "  Event Grid:        $EG_ENDPOINT"
+echo "    Subscriptions:   sub-analyzer, sub-summarizer,"
+echo "                     sub-reviewer, sub-results"
+echo "  Storage:           $STORAGE_NAME"
+echo "  App Insights:      $APPINS_NAME"
+echo ""
+echo "  .env file has been generated."
+echo "  RBAC roles have been assigned."
+echo "============================================================"

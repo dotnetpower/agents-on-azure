@@ -1,0 +1,176 @@
+name: Integration Tests
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly on Monday at 6 AM UTC
+  workflow_dispatch:
+    inputs:
+      framework:
+        description: 'Framework to test'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - semantic-kernel
+          - langgraph
+          - autogen
+          - microsoft-agent-framework
+      pattern:
+        description: 'Messaging pattern to test'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - single-agent
+          - multi-agent-servicebus
+          - multi-agent-eventhub
+          - multi-agent-eventgrid
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  UV_VERSION: "0.9.4"
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  integration-test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    environment: integration
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - framework: semantic-kernel
+            pattern: single-agent
+          - framework: semantic-kernel
+            pattern: multi-agent-servicebus
+          - framework: langgraph
+            pattern: single-agent
+          - framework: langgraph
+            pattern: multi-agent-servicebus
+          - framework: autogen
+            pattern: single-agent
+          - framework: autogen
+            pattern: multi-agent-servicebus
+          - framework: microsoft-agent-framework
+            pattern: single-agent
+          - framework: microsoft-agent-framework
+            pattern: multi-agent-servicebus
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check if should run
+        id: check
+        run: |
+          FRAMEWORK="${{ inputs.framework || 'all' }}"
+          PATTERN="${{ inputs.pattern || 'all' }}"
+          
+          if [[ "$FRAMEWORK" != "all" && "$FRAMEWORK" != "${{ matrix.framework }}" ]]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          if [[ "$PATTERN" != "all" && "$PATTERN" != "${{ matrix.pattern }}" ]]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "skip=false" >> $GITHUB_OUTPUT
+
+      - name: Azure Login
+        if: steps.check.outputs.skip != 'true'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install uv
+        if: steps.check.outputs.skip != 'true'
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Set up Python
+        if: steps.check.outputs.skip != 'true'
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        if: steps.check.outputs.skip != 'true'
+        run: uv sync --frozen
+
+      - name: Create .env file
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          cat > .env << EOF
+          AZURE_OPENAI_ENDPOINT=${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_MODEL=${{ secrets.AZURE_OPENAI_MODEL }}
+          AZURE_SERVICEBUS_NAMESPACE=${{ secrets.AZURE_SERVICEBUS_NAMESPACE }}
+          AZURE_EVENTHUB_NAMESPACE=${{ secrets.AZURE_EVENTHUB_NAMESPACE }}
+          AZURE_EVENTGRID_ENDPOINT=${{ secrets.AZURE_EVENTGRID_ENDPOINT }}
+          AZURE_STORAGE_ACCOUNT_NAME=${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
+          EOF
+
+      - name: Run Integration Test
+        if: steps.check.outputs.skip != 'true'
+        timeout-minutes: 10
+        run: |
+          cd samples/${{ matrix.framework }}/${{ matrix.pattern }}
+          uv run python src/main.py 2>&1 | tee output.log
+          
+          # Check for success indicators
+          if grep -q "Pipeline Complete\|completed\|success" output.log; then
+            echo "✅ Test passed"
+          else
+            echo "❌ Test may have failed"
+            exit 1
+          fi
+
+      - name: Upload test output
+        if: always() && steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-${{ matrix.framework }}-${{ matrix.pattern }}
+          path: samples/${{ matrix.framework }}/${{ matrix.pattern }}/output.log
+
+  report:
+    name: Test Report
+    runs-on: ubuntu-latest
+    needs: integration-test
+    if: always()
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: test-outputs
+
+      - name: Generate report
+        run: |
+          echo "# Integration Test Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Framework | Pattern | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          for dir in test-outputs/test-output-*; do
+            if [ -d "$dir" ]; then
+              name=$(basename "$dir" | sed 's/test-output-//')
+              framework=$(echo "$name" | cut -d'-' -f1-2)
+              pattern=$(echo "$name" | cut -d'-' -f3-)
+              
+              if [ -f "$dir/output.log" ]; then
+                if grep -q "Pipeline Complete\|completed\|success" "$dir/output.log"; then
+                  echo "| $framework | $pattern | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+                else
+                  echo "| $framework | $pattern | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+                fi
+              else
+                echo "| $framework | $pattern | ⚠️ No output |" >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+          done

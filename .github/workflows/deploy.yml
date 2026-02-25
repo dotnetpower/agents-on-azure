@@ -1,0 +1,148 @@
+name: Deploy Infrastructure
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'infra/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+      location:
+        description: 'Azure region'
+        required: true
+        default: 'koreacentral'
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  validate:
+    name: Validate Bicep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate Bicep
+        uses: azure/arm-deploy@v2
+        with:
+          scope: subscription
+          region: ${{ inputs.location || 'koreacentral' }}
+          template: infra/bicep/main.bicep
+          parameters: infra/bicep/parameters/${{ inputs.environment || 'dev' }}.bicepparam
+          deploymentMode: Validate
+          deploymentName: validate-${{ github.run_id }}
+          failOnStdErr: false
+
+  what-if:
+    name: What-If Analysis
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: What-If
+        uses: azure/arm-deploy@v2
+        with:
+          scope: subscription
+          region: ${{ inputs.location || 'koreacentral' }}
+          template: infra/bicep/main.bicep
+          parameters: infra/bicep/parameters/${{ inputs.environment || 'dev' }}.bicepparam
+          additionalArguments: --what-if
+
+  deploy-dev:
+    name: Deploy to Dev
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.ref == 'refs/heads/main' && (inputs.environment == 'dev' || inputs.environment == '')
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy Infrastructure
+        uses: azure/arm-deploy@v2
+        with:
+          scope: subscription
+          region: koreacentral
+          template: infra/bicep/main.bicep
+          parameters: infra/bicep/parameters/dev.bicepparam
+          deploymentName: deploy-dev-${{ github.run_id }}
+          failOnStdErr: false
+
+      - name: Output Deployment Info
+        run: |
+          echo "## Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "- Environment: dev" >> $GITHUB_STEP_SUMMARY
+          echo "- Region: koreacentral" >> $GITHUB_STEP_SUMMARY
+          echo "- Run ID: ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
+
+  deploy-prod:
+    name: Deploy to Prod
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.ref == 'refs/heads/main' && inputs.environment == 'prod'
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy Infrastructure
+        uses: azure/arm-deploy@v2
+        with:
+          scope: subscription
+          region: koreacentral
+          template: infra/bicep/main.bicep
+          parameters: infra/bicep/parameters/prod.bicepparam
+          deploymentName: deploy-prod-${{ github.run_id }}
+          failOnStdErr: false
+
+      - name: Output Deployment Info
+        run: |
+          echo "## Production Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "- Environment: prod" >> $GITHUB_STEP_SUMMARY
+          echo "- Region: koreacentral" >> $GITHUB_STEP_SUMMARY
+          echo "- Run ID: ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
